@@ -1,10 +1,11 @@
 from __future__ import annotations
 from typing import List
 from ecs.world import World
-from ecs.components import Position, GridMove, DieFaces, TumbleAnim, RenderCube, TileOccupancy, AIWalker, Tile
-from ecs.events import MOVE_REQUEST, MOVE_STARTED, MOVE_COMPLETE, Event as ECSEvent
+from ecs.components import Position, GridMove, DieFaces, TumbleAnim, RenderCube, TileOccupancy, AIWalker, Tile, TurnState, AttackSide, AttackEffect, HP, AttackSet, Patrol
+from ecs.components import Barrier
+from ecs.events import MOVE_REQUEST, MOVE_STARTED, MOVE_COMPLETE, PLAYER_MOVE_INTENT, Event as ECSEvent
+from ecs.attack_utils import get_attack_targets, get_attack_effects
 
-# (Removed placeholder position_sync_system & depth_sort; ordering handled in rendering.)
 
 
 def movement_request_system(world: World, dt: float):
@@ -29,6 +30,21 @@ def movement_request_system(world: World, dt: float):
             di = ev.data.get('di'); dj = ev.data.get('dj')
             if di in (None, ) or dj in (None, ):
                 continue
+            # Barrier collision: if target tile has a barrier, cancel move
+            barrier_store = world.get_component(Barrier)
+            blocked = False
+            if barrier_store:
+                target_i = pos.i + di
+                target_j = pos.j + dj
+                # Iterate barriers to see if any at target position
+                barrier_positions = world.get_component(Position)
+                for b_eid in barrier_store.keys():
+                    b_pos = barrier_positions.get(b_eid)
+                    if b_pos and b_pos.i == target_i and b_pos.j == target_j:
+                        blocked = True
+                        break
+            if blocked:
+                continue  # Skip creating movement for blocked target
             move_store[ev.entity] = GridMove(start_i=pos.i, start_j=pos.j, di=di, dj=dj)
             # Create tumble animation component (render interpolation & orientation deferral)
             faces = faces_store.get(ev.entity)
@@ -82,7 +98,7 @@ def orientation_system(world: World, dt: float):
     remaining = []
     deferred: List[ECSEvent] = []
     for ev in world.event_queue:
-        if ev.type == MOVE_COMPLETE and ev.entity in faces_store:
+        if ev.type == MOVE_COMPLETE and ev.entity in faces_store and not ev.data.get('orientation_done'):
             faces = faces_store[ev.entity].sides
             di = ev.data.get('di', 0)
             dj = ev.data.get('dj', 0)
@@ -90,13 +106,15 @@ def orientation_system(world: World, dt: float):
                 faces['top'], faces['east'], faces['bottom'], faces['west'] = faces['west'], faces['top'], faces['east'], faces['bottom']
             elif di == -1:
                 faces['top'], faces['west'], faces['bottom'], faces['east'] = faces['east'], faces['top'], faces['west'], faces['bottom']
-            elif dj == 1:
+            elif dj == 1:  # moving north (test expectation: top becomes previous south)
                 faces['top'], faces['north'], faces['bottom'], faces['south'] = faces['south'], faces['top'], faces['north'], faces['bottom']
-            elif dj == -1:
+            elif dj == -1:  # moving south (test expectation: top becomes previous north)
                 faces['top'], faces['south'], faces['bottom'], faces['north'] = faces['north'], faces['top'], faces['south'], faces['bottom']
             # Orientation applied; remove tumble animation component if present
             anim_store.pop(ev.entity, None)
-            # Consumed (not re-added)
+            # Tag event so it won't rotate again
+            ev.data['orientation_done'] = True
+            remaining.append(ev)
         else:
             remaining.append(ev)
     # Re-queue deferred events to try again next frame
@@ -148,26 +166,207 @@ def tile_occupancy_system(world: World, dt: float):
 
 
 def ai_walker_system(world: World, dt: float):
-    """Emit MOVE_REQUEST events for entities with AIWalker component at defined intervals.
+    """Deprecated random walker (left in place for compatibility but does nothing)."""
+    return
 
-    Chooses a random valid direction within bounds (0..7 for now) ignoring collisions.
+
+def enemy_planning_system(world: World, dt: float):
+    """Deterministic planning using Patrol components.
+
+    For each enemy (AIWalker + Patrol) during planning phase:
+    - Attempt to move in its patrol (di,dj) direction.
+    - If blocked by barrier or bounds, reverse (di,dj) on the Patrol component and attempt once.
+    - If still blocked, no move is planned this turn.
+    - Only plan if TurnState.planned is empty (one planning pass per phase).
     """
+    turn_store = world.get_component(TurnState)
+    if not turn_store:
+        return
+    turn = next(iter(turn_store.values()))
+    if turn.phase != 'planning' or turn.planned:
+        return
     pos_store = world.get_component(Position)
     ai_store = world.get_component(AIWalker)
-    for eid, ai in ai_store.items():
-        ai.timer += dt
-        if ai.timer >= ai.interval:
-            ai.timer = 0.0
-            pos = pos_store.get(eid)
-            if not pos:
+    patrol_store = world.get_component(Patrol)
+    barrier_store = world.get_component(Barrier)
+    barrier_positions = world.get_component(Position)
+    GRID_LIMIT = 8
+    for eid in ai_store.keys():
+        if eid not in patrol_store:
+            continue
+        pos = pos_store.get(eid)
+        patrol = patrol_store.get(eid)
+        if not pos or not patrol:
+            continue
+        attempts = 0
+        planned = None
+        while attempts < 2:
+            di, dj = patrol.di, patrol.dj
+            ti = pos.i + di; tj = pos.j + dj
+            blocked = False
+            # Bounds
+            if not (0 <= ti < GRID_LIMIT and 0 <= tj < GRID_LIMIT):
+                blocked = True
+            # Barriers
+            if not blocked and barrier_store:
+                for b_eid in barrier_store.keys():
+                    b_pos = barrier_positions.get(b_eid)
+                    if b_pos and b_pos.i == ti and b_pos.j == tj:
+                        blocked = True
+                        break
+            if blocked:
+                # Reverse direction and try once more
+                patrol.di *= -1
+                patrol.dj *= -1
+                attempts += 1
                 continue
-            # Candidate directions
-            dirs = [(1,0), (-1,0), (0,1), (0,-1)]
-            import random
-            random.shuffle(dirs)
-            for di, dj in dirs:
-                ni = pos.i + di; nj = pos.j + dj
-                if 0 <= ni < 8 and 0 <= nj < 8:  # TODO: parameterize grid size
-                    from ecs.events import Event as ECSEvent, MOVE_REQUEST
-                    world.emit(ECSEvent(type=MOVE_REQUEST, entity=eid, data={'di': di, 'dj': dj}))
-                    break
+            planned = {'entity': eid, 'di': di, 'dj': dj, 'ti': ti, 'tj': tj}
+            break
+        if planned:
+            turn.planned.append(planned)
+
+
+def turn_advance_system(world: World, dt: float):
+    """When executing phase and all moves resolved, return to planning phase and clear planned list."""
+    turn_store = world.get_component(TurnState)
+    if not turn_store:
+        return
+    turn = next(iter(turn_store.values()))
+    if turn.phase != 'executing':
+        return
+    move_store = world.get_component(GridMove)
+    anim_store = world.get_component(TumbleAnim)
+    # If no pending movement / animations, advance turn
+    if not move_store and not anim_store:
+        turn.phase = 'planning'
+        turn.planned.clear()
+        turn.planning_elapsed = 0.0
+
+
+def player_turn_commit_system(world: World, dt: float):
+    """Consume PLAYER_MOVE_INTENT during planning phase and commit player + enemy moves.
+
+    Mirrors logic previously embedded in window.on_key_press.
+    Rules:
+    - If target tile is barrier or claimed by enemy planned move, cancel (stay in planning).
+    - Otherwise emit MOVE_REQUEST for player and all enemy planned moves; set phase to executing.
+    """
+    turn_store = world.get_component(TurnState)
+    if not turn_store:
+        return
+    turn = next(iter(turn_store.values()))
+    if turn.phase != 'planning':
+        return
+    # Accumulate planning elapsed time for preview visibility gating
+    turn.planning_elapsed += dt
+    # Disallow intents while previous execution cleanup (shouldn't happen since phase != planning) or if any moves/animations lingering
+    move_store = world.get_component(GridMove)
+    anim_store = world.get_component(TumbleAnim)
+    if move_store or anim_store:
+        return
+    pos_store = world.get_component(Position)
+    barrier_store = world.get_component(Barrier)
+    remaining = []
+    MIN_PREVIEW_TIME = 0.05  # require at least 50ms in planning so previews can render
+    for ev in world.event_queue:
+        if ev.type == PLAYER_MOVE_INTENT and ev.entity is not None:
+            # Require at least enemy planning pass (if enemies exist) before accepting input
+            ai_store = world.get_component(AIWalker)
+            if ai_store and not turn.planned:
+                # Enemy not yet planned this frame; defer intent by keeping event in queue for next frame
+                remaining.append(ev)
+                continue
+            # Ensure previews have been visible long enough this planning phase
+            if turn.planning_elapsed < MIN_PREVIEW_TIME:
+                remaining.append(ev)
+                continue
+            di = ev.data.get('di', 0); dj = ev.data.get('dj', 0)
+            p_pos = pos_store.get(ev.entity)
+            if not p_pos:
+                continue
+            intended_ti = p_pos.i + di
+            intended_tj = p_pos.j + dj
+            enemy_targets = {(plan.get('ti'), plan.get('tj')) for plan in turn.planned if plan.get('ti') is not None}
+            # Barrier check
+            blocked = False
+            if barrier_store:
+                barrier_positions = world.get_component(Position)
+                for b_eid in barrier_store.keys():
+                    b_pos = barrier_positions.get(b_eid)
+                    if b_pos and b_pos.i == intended_ti and b_pos.j == intended_tj:
+                        blocked = True
+                        break
+            player_cancelled = blocked or (intended_ti, intended_tj) in enemy_targets
+            if player_cancelled:
+                # Stay in planning; do not emit moves
+                continue
+            # Emit player move
+            world.emit(ECSEvent(type=MOVE_REQUEST, entity=ev.entity, data={'di': di, 'dj': dj}))
+            # Emit enemy planned moves
+            for plan in turn.planned:
+                world.emit(ECSEvent(type=MOVE_REQUEST, entity=plan['entity'], data={'di': plan['di'], 'dj': plan['dj']}))
+            turn.phase = 'executing'
+        else:
+            remaining.append(ev)
+    world.event_queue = remaining
+
+
+def attack_effect_system(world: World, dt: float):
+    """Trigger attack effects when a die finishes movement based on its top face.
+
+    Supports both legacy single-face AttackSide and new per-face AttackSet.
+
+    Workflow:
+    - Listen for MOVE_COMPLETE events.
+    - After orientation_system has updated DieFaces, read the entity's 'top' face id.
+    - Resolve an AttackEffect either from AttackSet.effects[top_id] or an AttackSide whose face_id == top_id.
+    - Apply effect targeting (currently only 'forward-single').
+    - (Future) Emit damage events / visual feedback.
+    """
+    faces_store = world.get_component(DieFaces)
+    pos_store = world.get_component(Position)
+    hp_store = world.get_component(HP)
+    attack_side_store = world.get_component(AttackSide)
+    attack_set_store = world.get_component(AttackSet)
+    remaining = []
+    for ev in world.event_queue:
+        if ev.type == MOVE_COMPLETE and ev.entity in faces_store and ev.entity in pos_store:
+            top_face = faces_store[ev.entity].sides.get('top')
+            if not top_face:
+                # Consume if orientation already done to avoid perpetual event retention
+                if ev.data.get('orientation_done'):
+                    # Drop event
+                    continue
+                remaining.append(ev)
+                continue
+            # Resolve all effects via utility (supports multiple patterns per face)
+            effects = get_attack_effects(world, ev.entity)
+            if not effects:
+                if ev.data.get('orientation_done'):
+                    continue
+                remaining.append(ev)
+                continue
+            # Multi-effect handling (each pattern applied once)
+            di = ev.data.get('di', 0)
+            dj = ev.data.get('dj', 0)
+            pos = pos_store.get(ev.entity)
+            if not pos:
+                if ev.data.get('orientation_done'):
+                    continue
+                remaining.append(ev)
+                continue
+            targets_map = get_attack_targets(world, ev.entity, di, dj, pos.i, pos.j)
+            for eff in effects:
+                tiles = targets_map.get(eff.target_type, [])
+                for (ti, tj) in tiles:
+                    for target_eid, tpos in pos_store.items():
+                        if target_eid == ev.entity:
+                            continue
+                        if tpos.i == ti and tpos.j == tj and target_eid in hp_store:
+                            hp_comp = hp_store[target_eid]
+                            hp_comp.current = max(0, hp_comp.current - eff.strength)
+            # Consume MOVE_COMPLETE entirely after attack processed
+            continue
+        else:
+            remaining.append(ev)
+    world.event_queue = remaining

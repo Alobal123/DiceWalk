@@ -13,3 +13,4 @@ class Event:
 MOVE_REQUEST = "MoveRequest"
 MOVE_STARTED = "MoveStarted"
 MOVE_COMPLETE = "MoveComplete"
+PLAYER_MOVE_INTENT = "PlayerMoveIntent"
