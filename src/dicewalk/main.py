@@ -1,16 +1,25 @@
+"""Entry point for DiceWalkGame used by tests and runtime.
+
+Supports running directly as a script (python path/to/main.py) by bootstrapping
+the project src directory onto sys.path if needed.
+"""
+
 import arcade
-import sys
-from pathlib import Path
+import sys, pathlib
 
-# Add src directory to path to allow imports from game_objects
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Ensure src directory (this file's parent parent) is on sys.path when run directly
+_here = pathlib.Path(__file__).resolve()
+_src_root = _here.parent.parent
+if str(_src_root) not in sys.path:
+    sys.path.insert(0, str(_src_root))
 
-from game_objects.player_die import PlayerDie
-from game_objects.enemy_die import EnemyDie
-from core.game_object import GameObject
-from core.event_listener import EventListener
-from core.game_event import GameEvent, GameEventType
+from ecs.die_factory import create_player_die, create_enemy_die
+from ecs.components import Tile, Position
 from dicewalk.level import Level
+from ecs.world import World
+from ecs.systems import movement_request_system, movement_progress_system, orientation_system, tile_occupancy_system, ai_walker_system
+from ecs.rendering import render_ecs
+from ecs.events import Event as ECSEvent, MOVE_REQUEST as ECS_MOVE_REQUEST
 
 SCREEN_TITLE = "Dice Walk"
 GRID_SIZE = 8
@@ -22,76 +31,54 @@ class DiceWalkGame(arcade.Window):
         self.set_fullscreen(True)
         self.screen_width, self.screen_height = self.get_size()
         arcade.set_background_color(arcade.color.BLACK)
-        # Level encapsulates grid geometry and tiles
         self.level = Level(self.screen_width, self.screen_height, GRID_SIZE)
-        
-        # Event system
-        self.event_listener = EventListener()
-        
-        # Create dice and register them to tiles (player diagonally below enemy)
-        self.enemy_die = EnemyDie(grid_i=1, grid_j=1)
-        self.player_die = PlayerDie(grid_i=2, grid_j=2)
-        self.level.add_object(self.enemy_die, self.enemy_die.grid_i, self.enemy_die.grid_j)
-        self.level.add_object(self.player_die, self.player_die.grid_i, self.player_die.grid_j)
-        # Activate player die subscribing only to MOVE_REQUEST events
-        self.player_die.activate(self, events=[GameEventType.MOVE_REQUEST])
-        self.enemy_die.set_game_reference(self)
-        self.enemy_die.activate(self)
-        # Subscribe game to MOVE_COMPLETE to adjust tiles
-        # Subscribe level to MOVE_COMPLETE updates
-        self.event_listener.subscribe(self.level.on_event, [GameEventType.MOVE_COMPLETE])
 
-    # Delegate geometry helpers expected by dice / tiles
+        # ECS World and systems
+        self.world = World()
+        self.world.add_system(movement_request_system)
+        self.world.add_system(movement_progress_system)
+        self.world.add_system(orientation_system)
+        self.world.add_system(tile_occupancy_system)
+        self.world.add_system(ai_walker_system)
+
+        # Tile entities (static grid)
+        for i in range(GRID_SIZE):
+            for j in range(GRID_SIZE):
+                tid = self.world.create_entity()
+                self.world.add_component(tid, Position(i, j))
+                self.world.add_component(tid, Tile())
+
+        # Dice entities
+        self.enemy_entity = create_enemy_die(self.world, 1, 1)
+        self.player_entity = create_player_die(self.world, 2, 2)
+
     def _iso_point(self, i: float, j: float):
         return self.level.iso_point(i, j)
 
     def _tile_center(self, i: int, j: int):
         return self.level.tile_center(i, j)
 
+    def is_ecs_oriented(self, die) -> bool:
+        return True
+
     def on_draw(self):
         self.clear()
-        # Delegate drawing to level (passes itself so tile draw can call _tile_center)
         self.level.draw(arcade)
+        render_ecs(self.level, self.world)
 
     def on_key_press(self, key, modifiers):
-        # System commands - handle directly
         if key == arcade.key.ESCAPE:
-            self.close()
-            return
-        
-        if key == arcade.key.P:
-            self.player_die.paused = not self.player_die.paused
-            return
-        
-        # Gameplay commands - publish as events
-        if self.player_die.animating:
-            return
-        
+            self.close(); return
         di = dj = 0
-        if key == arcade.key.UP:
-            dj = 1
-        elif key == arcade.key.DOWN:
-            dj = -1
-        elif key == arcade.key.RIGHT:
-            di = 1
-        elif key == arcade.key.LEFT:
-            di = -1
-        
-        if di != 0 or dj != 0:
-            # Publish move request event instead of calling directly
-            self.event_listener.publish(GameEvent(
-                type=GameEventType.MOVE_REQUEST,
-                source=self,
-                payload={'di': di, 'dj': dj, 'game': self}
-            ))
+        if key == arcade.key.UP: dj = 1
+        elif key == arcade.key.DOWN: dj = -1
+        elif key == arcade.key.RIGHT: di = 1
+        elif key == arcade.key.LEFT: di = -1
+        if di or dj:
+            self.world.emit(ECSEvent(type=ECS_MOVE_REQUEST, entity=self.player_entity, data={'di': di, 'dj': dj}))
 
     def on_update(self, delta_time: float):
-        self.player_die.update(delta_time)
-        self.enemy_die.update(delta_time)
-
-    # Window no longer handles MOVE_COMPLETE (delegated to Level)
-    def on_event(self, event: GameEvent):
-        pass
+        self.world.update(delta_time)
 
 
 def main():
@@ -99,5 +86,5 @@ def main():
     arcade.run()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

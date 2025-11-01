@@ -1,58 +1,45 @@
-from game_objects.player_die import PlayerDie
-from game_objects.die_side import BlankSide
+from dicewalk.main import DiceWalkGame
+from ecs.events import Event as ECSEvent, MOVE_REQUEST
+from ecs.components import DieFaces
 
-class DummyGame:
-    def __init__(self):
-        self.tile_height = 10
-        self.tile_width = 20
-        self.origin_x = 0
-        self.origin_y = 0
-        def _iso_point(i,j):
-            x = self.origin_x + (i - j) * (self.tile_width / 2)
-            y = self.origin_y + (i + j) * (self.tile_height / 2)
-            return x, y
-        def _tile_center(i,j):
-            return _iso_point(i+0.5,j+0.5)
-        self._iso_point = _iso_point
-        self._tile_center = _tile_center
-        class EL: # minimal stub
-            def publish(self, ev):
-                pass
-        self.event_listener = EL()
-
-# Helper to finish tumble
-def finish_tumble(die):
-    die.animating = True
-    die.anim_type = 'tumble'
-    die.anim_elapsed = die.anim_duration
-    die._commit_orientation()
-    die.animating = False
+def _issue_move_and_advance(game: DiceWalkGame, di: int, dj: int):
+    game.world.emit(ECSEvent(type=MOVE_REQUEST, entity=game.player_entity, data={'di': di, 'dj': dj}))
+    game.world.update(0.36)  # > duration 0.35 to finish
 
 def test_orientation_east():
-    die = PlayerDie(0,0)
-    die.anim_di = 1; die.anim_dj = 0
-    start_top = die.sides['top']
-    finish_tumble(die)
-    # After east tumble: previous west goes to top per mapping
-    assert die.sides['top'] is not start_top
+    game = DiceWalkGame()
+    faces_store = game.world.get_component(DieFaces)
+    faces = faces_store[game.player_entity].sides
+    start_top = faces['top']; start_west = faces['west']
+    _issue_move_and_advance(game, 1, 0)
+    # After east move top should become previous west
+    assert faces_store[game.player_entity].sides['top'] is start_west
+    assert faces_store[game.player_entity].sides['top'] is not start_top
 
 def test_orientation_west():
-    die = PlayerDie(0,0)
-    die.anim_di = -1; die.anim_dj = 0
-    start_top = die.sides['top']
-    finish_tumble(die)
-    assert die.sides['top'] is not start_top
+    game = DiceWalkGame()
+    faces_store = game.world.get_component(DieFaces)
+    faces = faces_store[game.player_entity].sides
+    start_top = faces['top']; start_east = faces['east']
+    _issue_move_and_advance(game, -1, 0)
+    # After west move top should become previous east
+    assert faces_store[game.player_entity].sides['top'] is start_east
+    assert faces_store[game.player_entity].sides['top'] is not start_top
 
 def test_orientation_north():
-    die = PlayerDie(0,0)
-    die.anim_di = 0; die.anim_dj = 1
-    start_top = die.sides['top']
-    finish_tumble(die)
-    assert die.sides['top'] is not start_top
+    game = DiceWalkGame()
+    faces_store = game.world.get_component(DieFaces)
+    faces = faces_store[game.player_entity].sides
+    start_top = faces['top']; start_south = faces['south']
+    _issue_move_and_advance(game, 0, 1)
+    assert faces_store[game.player_entity].sides['top'] is start_south
+    assert faces_store[game.player_entity].sides['top'] is not start_top
 
 def test_orientation_south():
-    die = PlayerDie(0,0)
-    die.anim_di = 0; die.anim_dj = -1
-    start_top = die.sides['top']
-    finish_tumble(die)
-    assert die.sides['top'] is not start_top
+    game = DiceWalkGame()
+    faces_store = game.world.get_component(DieFaces)
+    faces = faces_store[game.player_entity].sides
+    start_top = faces['top']; start_north = faces['north']
+    _issue_move_and_advance(game, 0, -1)
+    assert faces_store[game.player_entity].sides['top'] is start_north
+    assert faces_store[game.player_entity].sides['top'] is not start_top

@@ -1,34 +1,26 @@
-from game_objects.enemy_die import EnemyDie
-from game_objects.player_die import PlayerDie
-
-class GameStub:
-    def __init__(self):
-        self.event_listener = type('EL', (), {'subscribe': lambda *a, **k: None, 'publish': lambda *a, **k: None})()
-        self.tile_height = 10
-        self.tile_width = 20
-        self.origin_x = 0
-        self.origin_y = 0
-        def _iso_point(i,j):
-            return (0,0)
-        def _tile_center(i,j):
-            return (0,0)
-        self._iso_point = _iso_point
-        self._tile_center = _tile_center
-        self.tiles = [[[] for _ in range(8)] for _ in range(8)]
+from dicewalk.main import DiceWalkGame
+from ecs.components import Position, AIWalker
+from ecs.events import Event as ECSEvent, MOVE_REQUEST
+import random
 
 def test_enemy_ai_move(monkeypatch):
-    g = GameStub()
-    e = EnemyDie(3,3)
-    e.set_game_reference(g)  # type: ignore[arg-type]
-    # Force timer exceed
-    e.move_timer = e.move_interval
-    # Monkeypatch tumble to just update target instantly
-    def fake_tumble(game, di, dj):
-        e.grid_i += di
-        e.grid_j += dj
-    e.tumble = fake_tumble
-    # Monkeypatch random.shuffle to keep order deterministic
-    monkeypatch.setattr('random.shuffle', lambda lst: None)
-    e.update(0.0)
-    # First direction in list is (1,0), so position should advance east
-    assert (e.grid_i, e.grid_j) == (4,3)
+    game = DiceWalkGame()
+    # Ensure enemy entity has AIWalker component (factory creates with AI by default)
+    ai_store = game.world.get_component(AIWalker)
+    enemy_entity = game.enemy_entity
+    ai = ai_store.get(enemy_entity)
+    assert ai is not None
+    # Force interval trigger
+    ai.timer = ai.interval
+    # Deterministic direction ordering
+    monkeypatch.setattr(random, 'shuffle', lambda lst: None)
+    # Run update small dt to trigger ai_walker_system emission
+    game.world.update(0.01)
+    # Advance movement to completion
+    game.world.update(0.36)
+    pos_store = game.world.get_component(Position)
+    pos = pos_store.get(enemy_entity)
+    # First direction list is (1,0) east; expect i advanced by 1
+    assert pos is not None
+    # Enemy starts at (1,1); deterministic east move advances to (2,1)
+    assert (pos.i, pos.j) == (2,1)
